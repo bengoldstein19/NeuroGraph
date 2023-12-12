@@ -7,6 +7,9 @@
 ## Relevant Code
 - Modified main.py, utils.py. Rest is same as forked repository.
 
+## Dependencies
+- Use conda environment from env.yml
+
 
 # NeuroGraph
 
