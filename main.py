@@ -45,8 +45,9 @@ parser.add_argument('--dataset', type=str, default='HCPGender')
 parser.add_argument('--runs', type=int, default=5)
 parser.add_argument('--device', type=str, default='cuda')
 parser.add_argument('--seed', type=int, default=123)
-parser.add_argument('--model', type=str, default="AirGC")
+parser.add_argument('--model', type=str, default="GCNConv")
 parser.add_argument('--hidden', type=int, default=64)
+parser.add_argument('--hidden_mlp', type=int, default=64)
 parser.add_argument('--num_layers', type=int, default=3)
 parser.add_argument('--epochs', type=int, default=100)
 parser.add_argument('--echo_epoch', type=int, default=50)
@@ -146,7 +147,6 @@ for index in range(args.runs):
     else:
         gnn = eval(args.model)
         model = ResidualGNNs(args,train_dataset,args.hidden,args.hidden_mlp,args.num_layers,gnn).to(args.device) ## apply GNN*
-    print(model)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total number of parameters is: {total_params}")
     # model.reset_parameters()
