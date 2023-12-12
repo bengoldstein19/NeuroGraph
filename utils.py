@@ -16,6 +16,35 @@ from torch_geometric.nn import APPNP, MLP, GCNConv, GINConv, SAGEConv, GraphConv
 from torch.nn import Conv1d, MaxPool1d, ModuleList
 import random
 import math
+import glob
+import json
+import numpy as np
+import pandas as pd
+import networkx as nx
+from tqdm import tqdm, trange
+
+from typing import Optional, Tuple, Union
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+from torch.nn import Parameter
+
+from torch_geometric.nn.conv import MessagePassing
+from torch_geometric.nn.dense.linear import Linear
+from torch_geometric.nn.inits import glorot, zeros
+from torch_geometric.typing import NoneType  # noqa
+from torch_geometric.typing import (
+    Adj,
+    OptPairTensor,
+    OptTensor,
+    Size,
+    SparseTensor,
+    torch_sparse,
+)
+
+from torch_geometric.utils.sparse import set_sparse_value
+
 softmax = torch.nn.LogSoftmax(dim=1)
 
 class GNNs(torch.nn.Module):
@@ -124,6 +153,11 @@ class ResidualGNNs(torch.nn.Module):
                 self.convs.append(GNN(num_features, hidden_channels,K=5))
                 for i in range(0, num_layers - 1):
                     self.convs.append(GNN(hidden_channels, hidden_channels,K=5))
+        elif args.model=="GAM":
+            if num_layers>0:
+                self.convs.append(GAM(num_features, hidden_channels))
+                for i in range(0, num_layers - 1):
+                    self.convs.append(GAM(hidden_channels, hidden_channels))
         else:
             if num_layers>0:
                 self.convs.append(GNN(num_features, hidden_channels))
@@ -236,6 +270,111 @@ class AirGC(torch.nn.Module):
         return F.log_softmax(x, dim=1)
 
 
+class StepNetworkLayer(torch.nn.Module):
+
+    def __init__(self, args, identifiers):
+
+        super(StepNetworkLayer, self).__init__()
+        self.identifiers = identifiers
+        self.args = args
+        self.setup_attention()
+        self.create_parameters()
+
+    def setup_attention(self):
+
+        self.attention = torch.ones((len(self.identifiers)))/len(self.identifiers)
+
+    def create_parameters(self):
+        self.theta_step_1 = torch.nn.Parameter(torch.Tensor(len(self.identifiers),
+                                                            self.args.step_dimensions))
+
+        self.theta_step_2 = torch.nn.Parameter(torch.Tensor(len(self.identifiers),
+                                                            self.args.step_dimensions))
+
+        self.theta_step_3 = torch.nn.Parameter(torch.Tensor(2*self.args.step_dimensions,
+                                                            self.args.combined_dimensions))
+
+        torch.nn.init.uniform_(self.theta_step_1, -1, 1)
+        torch.nn.init.uniform_(self.theta_step_2, -1, 1)
+        torch.nn.init.uniform_(self.theta_step_3, -1, 1)
+
+    def sample_node_label(self, orig_neighbors, graph, features):
+        neighbor_vector = torch.tensor([1.0 if n in orig_neighbors else 0.0 for n in graph.nodes()])
+        neighbor_features = torch.mm(neighbor_vector.view(1, -1), features)
+        attention_spread = self.attention * neighbor_features
+        normalized_attention_spread = attention_spread / attention_spread.sum()
+        normalized_attention_spread = normalized_attention_spread.detach().numpy().reshape(-1)
+        label = np.random.choice(np.arange(len(self.identifiers)), p=normalized_attention_spread)
+        return label
+
+    def make_step(self, node, graph, features, labels, inverse_labels):
+        orig_neighbors = set(nx.neighbors(graph, node))
+        label = self.sample_node_label(orig_neighbors, graph, features)
+        labels = list(set(orig_neighbors).intersection(set(inverse_labels[str(label)])))
+        new_node = random.choice(labels)
+        new_node_attributes = torch.zeros((len(self.identifiers), 1))
+        new_node_attributes[label, 0] = 1.0
+        attention_score = self.attention[label]
+        return new_node_attributes, new_node, attention_score
+
+    def forward(self, data, graph, features, node):
+        feature_row, node, attention_score = self.make_step(node, graph, features,
+                                                            data["labels"], data["inverse_labels"])
+
+        hidden_attention = torch.mm(self.attention.view(1, -1), self.theta_step_1)
+        hidden_node = torch.mm(torch.t(feature_row), self.theta_step_2)
+        combined_hidden_representation = torch.cat((hidden_attention, hidden_node), dim=1)
+        state = torch.mm(combined_hidden_representation, self.theta_step_3)
+        state = state.view(1, 1, self.args.combined_dimensions)
+        return state, node, attention_score
+
+class DownStreamNetworkLayer(torch.nn.Module):
+    def __init__(self, args, target_number, identifiers):
+        super(DownStreamNetworkLayer, self).__init__()
+        self.args = args
+        self.target_number = target_number
+        self.identifiers = identifiers
+        self.create_parameters()
+
+    def create_parameters(self):
+        self.theta_classification = torch.nn.Parameter(torch.Tensor(self.args.combined_dimensions, self.target_number))
+        self.theta_rank = torch.nn.Parameter(torch.Tensor(self.args.combined_dimensions, len(self.identifiers)))
+        torch.nn.init.xavier_normal_(self.theta_classification)
+        torch.nn.init.xavier_normal_(self.theta_rank)
+
+    def forward(self, hidden_state):
+        predictions = torch.mm(hidden_state.view(1, -1), self.theta_classification)
+        attention = torch.mm(hidden_state.view(1, -1), self.theta_rank)
+        attention = torch.nn.functional.softmax(attention, dim=1)
+        return predictions, attention
+
+class GAM(torch.nn.Module):
+    def __init__(self, args):
+        super(GAM, self).__init__()
+        self.args = args
+        self.identifiers, self.class_number = read_node_labels(self.args)
+        self.step_block = StepNetworkLayer(self.args, self.identifiers)
+        self.recurrent_block = torch.nn.LSTM(self.args.combined_dimensions,
+                                             self.args.combined_dimensions, 1)
+
+        self.down_block = DownStreamNetworkLayer(self.args, self.class_number, self.identifiers)
+        self.reset_attention()
+
+    def reset_attention(self):
+        self.step_block.attention = torch.ones((len(self.identifiers)))/len(self.identifiers)
+        self.lstm_h_0 = torch.randn(1, 1, self.args.combined_dimensions)
+        self.lstm_c_0 = torch.randn(1, 1, self.args.combined_dimensions)
+
+    def forward(self, data, graph, features, node):
+        self.state, node, attention_score = self.step_block(data, graph, features, node)
+        lstm_output, (self.h0, self.c0) = self.recurrent_block(self.state,
+                                                               (self.lstm_h_0, self.lstm_c_0))
+        label_predictions, attention = self.down_block(lstm_output)
+        self.step_block.attention = attention.view(-1)
+        label_predictions = torch.nn.functional.log_softmax(label_predictions, dim=1)
+        return label_predictions, node, attention_score
+
+
 ### UNCHANGED FROM AIRGNN REPO https://github.com/lxiaorui/AirGNN/blob/main/model.py ####
 class AdaptiveMessagePassing(MessagePassing):
     _cached_edge_index: Optional[Tuple[Tensor, Tensor]]
@@ -341,3 +480,191 @@ class AdaptiveMessagePassing(MessagePassing):
         return '{}(K={}, alpha={}, mode={}, dropout={}, lambda_amp={})'.format(self.__class__.__name__, self.K,
                                                                self.alpha, self.mode, self.dropout,
                                                                self.args.lambda_amp)
+
+from torch_geometric.utils import (
+    add_self_loops,
+    is_torch_sparse_tensor,
+    remove_self_loops,
+    softmax,
+)
+
+class GAM(MessagePassing):
+    def __init__(
+        self,
+        in_channels: Union[int, Tuple[int, int]],
+        out_channels: int,
+        heads: int = 1,
+        concat: bool = True,
+        negative_slope: float = 0.2,
+        dropout: float = 0.9,
+        add_self_loops: bool = True,
+        edge_dim: Optional[int] = None,
+        fill_value: Union[float, Tensor, str] = 'mean',
+        bias: bool = True,
+        **kwargs,
+    ):
+        kwargs.setdefault('aggr', 'add')
+        super().__init__(node_dim=0, **kwargs)
+        print(in_channels)
+        self.reccurent_block = torch.nn.LSTM(in_channels, in_channels, 1)
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.heads = heads
+        self.concat = concat
+        self.negative_slope = negative_slope
+        self.dropout = dropout
+        self.add_self_loops = add_self_loops
+        self.edge_dim = edge_dim
+        self.fill_value = fill_value
+
+        self.lin = self.lin_src = self.lin_dst = None
+        if isinstance(in_channels, int):
+            self.lin = Linear(in_channels, heads * out_channels, bias=False,
+                              weight_initializer='glorot')
+        else:
+            self.lin_src = Linear(in_channels[0], heads * out_channels, False,
+                                  weight_initializer='glorot')
+            self.lin_dst = Linear(in_channels[1], heads * out_channels, False,
+                                  weight_initializer='glorot')
+        self.att_src = Parameter(torch.empty(1, heads, out_channels))
+        self.att_dst = Parameter(torch.empty(1, heads, out_channels))
+
+        if edge_dim is not None:
+            self.lin_edge = Linear(edge_dim, heads * out_channels, bias=False,
+                                   weight_initializer='glorot')
+            self.att_edge = Parameter(torch.empty(1, heads, out_channels))
+        else:
+            self.lin_edge = None
+            self.register_parameter('att_edge', None)
+
+        if bias and concat:
+            self.bias = Parameter(torch.empty(heads * out_channels))
+        elif bias and not concat:
+            self.bias = Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter('bias', None)
+
+        self.reset_parameters()
+
+    
+
+    def reset_parameters(self):
+        super().reset_parameters()
+        if self.lin is not None:
+            self.lin.reset_parameters()
+        if self.lin_src is not None:
+            self.lin_src.reset_parameters()
+        if self.lin_dst is not None:
+            self.lin_dst.reset_parameters()
+        if self.lin_edge is not None:
+            self.lin_edge.reset_parameters()
+        glorot(self.att_src)
+        glorot(self.att_dst)
+        glorot(self.att_edge)
+        zeros(self.bias)
+
+        #self.step_block.attention = torch.ones((len(self.identifiers)))/len(self.identifiers)
+        self.lstm_h_0 = torch.randn(1, 1, self.in_channels)
+        self.lstm_c_0 = torch.randn(1, 1, self.in_channels)
+
+
+    def forward(
+        self,
+        x: Union[Tensor, OptPairTensor],
+        edge_index: Adj,
+        edge_attr: OptTensor = None,
+        size: Size = None,
+        return_attention_weights=None,
+    ):
+        H, C = self.heads, self.out_channels
+        if isinstance(x, Tensor):
+            assert x.dim() == 2, "Static graphs not supported in 'GATConv'"
+
+            if self.lin is not None:
+                x_src = x_dst = self.lin(x).view(-1, H, C)
+            else:
+                assert self.lin_src is not None and self.lin_dst is not None
+                x_src = self.lin_src(x).view(-1, H, C)
+                x_dst = self.lin_dst(x).view(-1, H, C)
+
+        else: 
+            x_src, x_dst = x
+            assert x_src.dim() == 2, "Static graphs not supported in 'GATConv'"
+
+            if self.lin is not None:
+                x_src = self.lin(x_src).view(-1, H, C)
+                if x_dst is not None:
+                    x_dst = self.lin(x_dst).view(-1, H, C)
+            else:
+                assert self.lin_src is not None and self.lin_dst is not None
+
+                x_src = self.lin_src(x_src).view(-1, H, C)
+                if x_dst is not None:
+                    x_dst = self.lin_dst(x_dst).view(-1, H, C)
+
+        x = (x_src, x_dst)
+
+        alpha_src = (x_src * self.att_src).sum(dim=-1)
+        alpha_dst = None if x_dst is None else (x_dst * self.att_dst).sum(-1)
+        alpha = (alpha_src, alpha_dst)
+
+        if self.add_self_loops:
+            if isinstance(edge_index, Tensor):
+
+                num_nodes = x_src.size(0)
+                if x_dst is not None:
+                    num_nodes = min(num_nodes, x_dst.size(0))
+                num_nodes = min(size) if size is not None else num_nodes
+                edge_index, edge_attr = remove_self_loops(
+                    edge_index, edge_attr)
+                edge_index, edge_attr = add_self_loops(
+                    edge_index, edge_attr, fill_value=self.fill_value,
+                    num_nodes=num_nodes)
+            elif isinstance(edge_index, SparseTensor):
+                if self.edge_dim is None:
+                    edge_index = torch_sparse.set_diag(edge_index)
+                else:
+                    quit()
+
+        alpha = self.edge_updater(edge_index, alpha=alpha, edge_attr=edge_attr)
+        out = self.propagate(edge_index, x=x, alpha=alpha, size=size)
+        
+        if self.concat:
+            out = out.view(-1, self.heads * self.out_channels)
+        else:
+            out = out.mean(dim=1)
+
+        if self.bias is not None:
+            out = out + self.bias
+
+
+        return out
+
+
+    def edge_update(self, alpha_j: Tensor, alpha_i: OptTensor,
+                    edge_attr: OptTensor, index: Tensor, ptr: OptTensor,
+                    size_i: Optional[int]) -> Tensor:
+        alpha = alpha_j if alpha_i is None else alpha_j + alpha_i
+        if index.numel() == 0:
+            return alpha
+        if edge_attr is not None and self.lin_edge is not None:
+            if edge_attr.dim() == 1:
+                edge_attr = edge_attr.view(-1, 1)
+            edge_attr = self.lin_edge(edge_attr)
+            edge_attr = edge_attr.view(-1, self.heads, self.out_channels)
+            alpha_edge = (edge_attr * self.att_edge).sum(dim=-1)
+            alpha = alpha + alpha_edge
+
+        alpha = F.leaky_relu(alpha, self.negative_slope)
+        alpha = softmax(alpha, index, ptr, size_i)
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+        return alpha
+
+    def message(self, x_j: Tensor, alpha: Tensor) -> Tensor:
+        return alpha.unsqueeze(-1) * x_j
+
+    def __repr__(self) -> str:
+        return (f'{self.__class__.__name__}({self.in_channels}, '
+                f'{self.out_channels}, heads={self.heads})')
+
