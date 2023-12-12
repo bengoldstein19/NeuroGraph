@@ -2,7 +2,7 @@
 
 ## Usage
 - Run ./run_baseline-airgc.sh to run airgc (adaptive residual graph classifier) with default parameters on HCPActivity dataset. To change dataset or other params modify shell script
-- Something for GAM...
+- Run ./run_baseline-gam.sh to run gam with default parameters on HCPActivity dataset. To change dataset or other params modify shell script
 
 ## Relevant Code
 - Modified main.py, utils.py. Rest is same as forked repository.
