@@ -1,3 +1,13 @@
+# Fork of NeuroGraph for CPSC483 Final Project
+
+## Usage
+- Run ./run_baseline-airgc.sh to run airgc (adaptive residual graph classifier) with default parameters on HCPActivity dataset. To change dataset or other params modify shell script
+- Something for GAM...
+
+## Relevant Code
+- Modified main.py, utils.py. Rest is same as forked repository.
+
+
 # NeuroGraph
 
 [Documentation](https://neurograph.readthedocs.io/en/latest/) | [Paper](https://arxiv.org/pdf/2306.06202.pdf) | [Website](https://anwar-said.github.io/anwarsaid/neurograph.html)
