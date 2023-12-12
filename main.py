@@ -2,6 +2,7 @@ from NeuroGraph.datasets import NeuroGraphDataset
 import argparse
 import torch
 import torch.nn.functional as F
+import torch_geometric.transforms as T
 from torch.optim import Adam
 import numpy as np
 from sklearn.metrics import accuracy_score
@@ -13,26 +14,59 @@ import sys
 import time
 from utils import *
 
+def str2bool(v):
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Unsupported value encountered.')
+
+def get_neurograph_dataset_airgc(name, normalize_features=False, transform=None):
+    path = './data/airgnn'
+    dataset = NeuroGraphDataset(root=path, name=name)
+
+    if transform is not None and normalize_features:
+        dataset.transform = T.Compose([T.NormalizeFeatures(), transform])
+    elif normalize_features:
+        dataset.transform = T.NormalizeFeatures()
+    elif transform is not None:
+        dataset.transform = transform
+
+    return dataset
+
+def prepare_data_airgc(args, lcc=False):
+    transform = T.ToSparseTensor()
+    dataset = get_neurograph_dataset_airgc(args.dataset, args.normalize_features, transform)
+    return dataset
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, default='HCPGender')
-parser.add_argument('--runs', type=int, default=1)
+parser.add_argument('--runs', type=int, default=5)
 parser.add_argument('--device', type=str, default='cuda')
 parser.add_argument('--seed', type=int, default=123)
-parser.add_argument('--model', type=str, default="GCNConv")
-parser.add_argument('--hidden', type=int, default=32)
-parser.add_argument('--hidden_mlp', type=int, default=64)
+parser.add_argument('--model', type=str, default="AirGC")
+parser.add_argument('--hidden', type=int, default=64)
 parser.add_argument('--num_layers', type=int, default=3)
 parser.add_argument('--epochs', type=int, default=100)
 parser.add_argument('--echo_epoch', type=int, default=50)
 parser.add_argument('--batch_size', type=int, default=16)
-parser.add_argument('--early_stopping', type=int, default=50)
 parser.add_argument('--lr', type=float, default=1e-5)
 parser.add_argument('--weight_decay', type=float, default=0.0005)
 parser.add_argument('--dropout', type=float, default=0.5)
+
+parser.add_argument('--alpha', type=float, default=0.1)
+parser.add_argument('--lambda_amp', type=float, default=0.1)
+parser.add_argument('--lcc', type=str2bool, default=False)
+parser.add_argument('--normalize_features', type=str2bool, default=True)
+parser.add_argument('--K', type=int, default=5, help="the number of propagagtion in AirGNN")
+parser.add_argument('--model_cache', type=str2bool, default=False)
+
+
 args = parser.parse_args()
-path = "base_params/"
-res_path = "results/"
-root = "data/"
+path = "./base_params/"
+res_path = "./results/"
+root = "./data/"
 if not os.path.isdir(path):
     os.mkdir(path)
 if not os.path.isdir(res_path):
@@ -47,16 +81,17 @@ if torch.cuda.is_available():
 random.seed(args.seed)
 np.random.seed(args.seed)
 
-
-dataset = NeuroGraphDataset(root=root, name= args.dataset)
+if args.model == "AirGC":
+    dataset = prepare_data_airgc(args, lcc=args.lcc)
+else:
+    dataset = NeuroGraphDataset(root=root, name= args.dataset)
 print(dataset.num_classes)
 print(len(dataset))
 
 print("dataset loaded successfully!",args.dataset)
 labels = [d.y.item() for d in dataset]
 
-train_tmp, test_indices = train_test_split(list(range(len(labels))),
-                        test_size=0.2, stratify=labels,random_state=123,shuffle= True)
+train_tmp, test_indices = train_test_split(list(range(len(labels))), test_size=0.2, stratify=labels,random_state=123,shuffle= True)
 tmp = dataset[train_tmp]
 train_labels = [d.y.item() for d in tmp]
 train_indices, val_indices = train_test_split(list(range(len(train_labels))),
@@ -92,10 +127,10 @@ def test(loader):
         out = model(data)  
         pred = out.argmax(dim=1)  # Use the class with highest probability.
         correct += int((pred == data.y).sum())  # Check against ground-truth labels.
-    return correct / len(loader.dataset)  
+    return correct / len(loader.dataset), criterion(out, data.y).item()   
 
 val_acc_history, test_acc_history, test_loss_history = [],[],[]
-seeds = [123,124]
+seeds = list(range(123, 123 + args.runs + 1))
 for index in range(args.runs):
     start = time.time()
     torch.manual_seed(seeds[index])
@@ -105,9 +140,12 @@ for index in range(args.runs):
     np.random.seed(seeds[index])
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    gnn = eval(args.model)
     # model = GNNs(args,train_dataset,args.hidden,args.num_layers,gnn).to(args.device) # to apply GNNs 
-    model = ResidualGNNs(args,train_dataset,args.hidden,args.hidden_mlp,args.num_layers,gnn).to(args.device) ## apply GNN*
+    if args.model == "AirGC":
+        model = AirGC(dataset, args).to(args.device)
+    else:
+        gnn = eval(args.model)
+        model = ResidualGNNs(args,train_dataset,args.hidden,args.hidden_mlp,args.num_layers,gnn).to(args.device) ## apply GNN*
     print(model)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total number of parameters is: {total_params}")
@@ -117,15 +155,14 @@ for index in range(args.runs):
     best_val_acc,best_val_loss = 0.0,0.0
     for epoch in range(args.epochs):
         loss = train(train_loader)
-        val_acc = test(val_loader)
-        test_acc = test(test_loader)
+        val_acc, _ = test(val_loader)
+        test_acc, _ = test(test_loader)
         # if epoch%10==0:
         print("epoch: {}, loss: {}, val_acc:{}, test_acc:{}".format(epoch, np.round(loss.item(),6), np.round(val_acc,2),np.round(test_acc,2)))
         val_acc_history.append(val_acc)
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            if epoch> int(args.epochs/2):
-                torch.save(model.state_dict(), path + args.dataset+args.model+'task-checkpoint-best-acc.pkl')
+            torch.save(model.state_dict(), path + args.dataset+args.model+'task-checkpoint-best-acc.pkl')
         # if args.early_stopping > 0 and epoch > args.epochs // 2:
         #     tmp = tensor(val_acc_history[-(args.early_stopping + 1):-1])
         #     # print(tmp)
@@ -134,8 +171,7 @@ for index in range(args.runs):
         #         break
     model.load_state_dict(torch.load(path + args.dataset+args.model+'task-checkpoint-best-acc.pkl'))
     model.eval()
-    test_acc = test(test_loader)
-    test_loss = train(test_loader).item()
+    test_acc, test_loss = test(test_loader)
     test_acc_history.append(test_acc)
     test_loss_history.append(test_loss)
 end = time.time()
